@@ -17,8 +17,8 @@
 ## 설치
 
 ```bash
-git clone <저장소 주소>
-cd boxoffice-showtime
+git clone https://github.com/profitj/project-boxoffice.git
+cd project-boxoffice
 python -m venv .venv
 source .venv/Scripts/activate   # Windows Git Bash (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
