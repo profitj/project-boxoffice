@@ -1,5 +1,6 @@
-
 """정리·결합: 중복·결측 처리, 날짜·영화코드로 결합, 상영 1회당 관객 수 계산.
+
+서비스 질문: 멀티플렉스 편성 담당자가 개봉 2주차에 어느 영화의 상영 횟수를 줄이고, 어느 영화를 유지할까?
 
 collect.py가 받은 박스오피스(+ 상세정보, 공휴일)를 정리하고 합쳐서 저장한다.
 
@@ -107,7 +108,10 @@ def clean_boxoffice(box, log):
     box = box.drop_duplicates()
     log["dup_exact"] = before - len(box)
 
-    # 중복 ② 키(날짜+영화코드)는 같은데 값이 다른 행 (나중에 보정된 값) → 마지막 행만 남김
+    # 중복 ② 키(날짜+영화코드)는 같은데 값이 다른 행 (나중에 보정된 값) → 가장 나중에 수집한 행만 남김
+    #   fetched_at(수집 시각)이 있으면 그 순서로 정렬. 시각이 없는 옛 파일은 가장 오래된 것으로 봄
+    if "fetched_at" in box.columns:
+        box = box.sort_values("fetched_at", na_position="first", kind="stable")
     log["dup_key_rows"] = box[box.duplicated(subset=KEY, keep=False)]
     before = len(box)
     box = box.drop_duplicates(subset=KEY, keep="last")
@@ -213,8 +217,26 @@ def merge_all(box, info, hol, log):
         merged["audi_per_show"] = pd.NA
     # (검증용) 평균 관람료 = 매출액 ÷ 관객수. 특별관처럼 튀는 값을 찾는 데 씀
     merged["avg_price"] = (merged["sales_amt"] / merged["audi_cnt"].where(merged["audi_cnt"] > 0)).round(0)
+    # 개봉 경과일과 주차 : 개봉일 = 1일째, 1~7일째 = 1주차, 8~14일째 = 2주차
+    # (개봉일 전 유료 시사회 상영은 0 이하가 되어 0주차로 표시. 개봉일이 비어 있으면 빈칸)
+    days = (merged["date"] - to_date(merged["open_dt"])).dt.days + 1
+    merged["days_since_open"] = days.astype("Int64")
+    merged["week_since_open"] = ((days.clip(lower=0) + 6) // 7).astype("Int64")
     # 개봉 후 1년이 넘었으면 재개봉·장기상영으로 표시만 한다 (지우지 않음)
-    merged["is_rerelease"] = (merged["date"] - to_date(merged["open_dt"])).dt.days > 365
+    merged["is_rerelease"] = days > 366
+
+    # 같은 날 Top10 안에서의 비중 (%) : 상영을 얼마나 받았나 vs 관객을 얼마나 모았나
+    if "show_cnt" in merged.columns:
+        day_show = merged.groupby("date")["show_cnt"].transform("sum")
+        day_audi = merged.groupby("date")["audi_cnt"].transform("sum")
+        merged["show_share"] = (merged["show_cnt"] / day_show.where(day_show > 0) * 100).round(1)
+        merged["audi_share"] = (merged["audi_cnt"] / day_audi.where(day_audi > 0) * 100).round(1)
+        # 상영 효율 지수 = 이 영화의 상영 1회당 관객 수 ÷ 그날 Top10 전체의 상영 1회당 관객 수
+        # 1보다 크면 평균보다 상영 1회에 관객이 많이 든 영화, 1보다 작으면 적게 든 영화
+        day_per_show = day_audi / day_show.where(day_show > 0)
+        # 반올림하기 전 값으로 나눠야 오차가 생기지 않는다
+        raw_per_show = merged["audi_cnt"] / merged["show_cnt"].where(merged["show_cnt"] > 0)
+        merged["efficiency"] = (raw_per_show / day_per_show).round(2)
 
     log["merged"] = len(merged)
     return merged
@@ -257,7 +279,7 @@ def write_report(merged, log, source_name, files):
         "| --- | ---: | --- |",
         f"| 원본 | {log['box_raw']} | 수집 파일 전체 행 수 |",
         f"| 제거: 완전히 같은 중복 | -{log['dup_exact']} | 같은 날짜를 두 번 수집한 경우 |",
-        f"| 제거: 키 중복 (값이 다름) | -{log['dup_key']} | 같은 날짜·영화인데 값이 다른 행. 마지막 수집 값만 남김 |",
+        f"| 제거: 키 중복 (값이 다름) | -{log['dup_key']} | 같은 날짜·영화인데 값이 다른 행. 가장 나중에 수집한 값(fetched_at 기준)만 남김 |",
         f"| 제거: 필수값 빈칸 | -{log['na']} | {', '.join(REQUIRED)} 중 하나라도 빈 행 |",
         f"| **정리 후** | **{log['box_clean']}** | |",
         "",
@@ -369,8 +391,10 @@ def run():
         print("③ 결합: 상세정보 파일 없음 → 건너뜀")
 
     cols = ["date", "weekday", "day_type", "is_holiday", "holiday_name", "rank", "movie_cd", "movie_nm",
-            "open_dt", "is_rerelease", "genre_nm", "nation_nm", "watch_grade_nm",
-            "audi_cnt", "show_cnt", "audi_per_show", "sales_amt", "avg_price", "scrn_cnt"]
+            "open_dt", "days_since_open", "week_since_open", "is_rerelease",
+            "genre_nm", "nation_nm", "watch_grade_nm",
+            "audi_cnt", "show_cnt", "audi_per_show", "show_share", "audi_share", "efficiency",
+            "sales_amt", "avg_price", "scrn_cnt"]
     out = merged[[c for c in cols if c in merged.columns]].sort_values(["date", "rank"])
     out["date"] = out["date"].dt.strftime("%Y-%m-%d")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
