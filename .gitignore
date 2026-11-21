@@ -10,8 +10,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# 수집한 원본·정리 데이터 (샘플만 올림)
-data/raw/
+# 원본 응답(JSON)과 정리 결과는 올리지 않음 (수집한 CSV와 샘플은 올림)
+data/raw/json/
 data/clean/
 
 # 편집기·OS
