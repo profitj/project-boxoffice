@@ -42,6 +42,8 @@ KEY = ["date", "movie_cd"]                          # 행 하나를 구분하는
 REQUIRED = ["date", "movie_cd", "audi_cnt"]         # 비어 있으면 행을 지우는 컬럼
 NUMBERS = ["rank", "sales_amt", "audi_cnt", "scrn_cnt", "show_cnt"]
 TOP_N = 10                                          # 일별 박스오피스는 하루 10편
+WINDOW = 7                                          # 편성 판단에 쓰는 기간 (최근 7일)
+RERELEASE_DAYS = 366                                # 개봉 후 이 날수를 넘으면 재개봉작으로 보고 제거
 
 # API 원래 이름(camelCase)으로 저장된 파일이 와도 우리 이름(snake_case)으로 맞춰 준다
 RENAME = {
@@ -122,6 +124,14 @@ def clean_boxoffice(box, log):
     before = len(box)
     box = box.dropna(subset=REQUIRED)
     log["na"] = before - len(box)
+
+    # 재개봉작 제거 : KOBIS는 재개봉작의 개봉일을 원래 개봉일로 주므로, 개봉 후 1년이 넘은 영화를 재개봉작으로 본다
+    #   (편성 판단 대상이 아니고, 특별관 소량 상영이라 평균·점유율을 왜곡하므로 정리 단계에서 뺀다. 개봉일이 빈 영화는 남김)
+    days = (box["date"] - to_date(box["open_dt"])).dt.days + 1
+    is_rerelease = days > RERELEASE_DAYS
+    log["rerelease_rows"] = box[is_rerelease]
+    log["rerelease"] = int(is_rerelease.sum())
+    box = box[~is_rerelease]
 
     for col in NUMBERS:
         if col in box.columns and box[col].notna().all():
@@ -222,8 +232,6 @@ def merge_all(box, info, hol, log):
     days = (merged["date"] - to_date(merged["open_dt"])).dt.days + 1
     merged["days_since_open"] = days.astype("Int64")
     merged["week_since_open"] = ((days.clip(lower=0) + 6) // 7).astype("Int64")
-    # 개봉 후 1년이 넘었으면 재개봉·장기상영으로 표시만 한다 (지우지 않음)
-    merged["is_rerelease"] = days > 366
 
     # 같은 날 Top10 안에서의 비중 (%) : 상영을 얼마나 받았나 vs 관객을 얼마나 모았나
     if "show_cnt" in merged.columns:
@@ -238,7 +246,90 @@ def merge_all(box, info, hol, log):
         raw_per_show = merged["audi_cnt"] / merged["show_cnt"].where(merged["show_cnt"] > 0)
         merged["efficiency"] = (raw_per_show / day_per_show).round(2)
 
+    merged = add_window_columns(merged)
     log["merged"] = len(merged)
+    return merged
+
+
+def add_window_columns(merged, window=WINDOW):
+    """각 행(영화 × 날짜)에 '이번 주(최근 7일)'와 '전주(그 직전 7일)' 값을 붙인다.
+
+    이번 주 = 기준일 포함 최근 7일 (기준일 11/14 → 11/8~11/14)
+    전주     = 그 직전 7일            (기준일 11/14 → 11/1~11/7)
+    두 기간 모두 연속 7일이라 주말이 한 번씩 들어가 요일 영향이 같다.
+
+    - audi_avg_7d       : 이번 주 하루 평균 관객 수 = 이번 주 관객 합 ÷ 이번 주 Top10에 든 날 수
+    - audi_avg_prev7d   : 전주 하루 평균 관객 수
+    - audi_change_7d    : 전주 대비 증감률(%) = (이번 주 ÷ 전주 − 1) × 100. 전주 데이터가 없으면 빈칸
+    - days_in_7d / days_in_prev7d : 각 주에 Top10에 든 날 수 (적으면 평균을 믿기 어려움)
+    - efficiency_7d     : 이번 주 상영 효율 지수 (같은 7일 Top10 평균 대비, 참고용)
+    """
+    cols = ["days_in_7d", "window_days_7d", "audi_7d", "show_7d", "audi_avg_7d", "audi_per_show_7d", "efficiency_7d",
+            "days_in_prev7d", "window_days_prev7d", "audi_prev7d", "audi_avg_prev7d", "audi_change_7d"]
+    if "show_cnt" not in merged.columns:
+        for c in cols:
+            merged[c] = pd.NA
+        return merged
+
+    merged = merged.copy()
+    all_dates = set(merged["date"].dropna().unique())
+
+    def window_stats(end):
+        start = end - pd.Timedelta(days=window - 1)
+        win = merged[(merged["date"] >= start) & (merged["date"] <= end)]
+        per_movie = win.groupby("movie_cd").agg(days=("date", "count"), audi=("audi_cnt", "sum"), show=("show_cnt", "sum"))
+        total_show = win["show_cnt"].sum()
+        base = win["audi_cnt"].sum() / total_show if total_show > 0 else float("nan")
+        n_days = sum(1 for d in pd.date_range(start, end) if d in all_dates)
+        return per_movie, base, n_days
+
+    rows = []
+    for d in sorted(all_dates):
+        cur, base, n_cur = window_stats(d)
+        prev, _, n_prev = window_stats(d - pd.Timedelta(days=window))
+        today = merged.loc[merged["date"] == d, ["movie_cd"]]
+        today = today.join(cur.add_suffix("_c"), on="movie_cd").join(prev.add_suffix("_p"), on="movie_cd")
+        today["base"], today["window_days_7d"], today["window_days_prev7d"] = base, n_cur, n_prev
+        rows.append(today)
+
+    w = pd.concat(rows)
+    w["days_in_7d"], w["audi_7d"], w["show_7d"] = w["days_c"], w["audi_c"], w["show_c"]
+    w["audi_avg_7d"] = (w["audi_c"] / w["days_c"]).round(0)
+    w["audi_per_show_7d"] = (w["audi_c"] / w["show_c"].where(w["show_c"] > 0)).round(1)
+    w["efficiency_7d"] = ((w["audi_c"] / w["show_c"].where(w["show_c"] > 0)) / w["base"]).round(2)
+    w["days_in_prev7d"] = w["days_p"].fillna(0)
+    w["audi_prev7d"] = w["audi_p"]
+    w["audi_avg_prev7d"] = (w["audi_p"] / w["days_p"]).round(0)
+    w["audi_change_7d"] = ((w["audi_c"] / w["days_c"]) / (w["audi_p"] / w["days_p"]) * 100 - 100).round(1)
+    for c in cols:
+        merged[c] = w[c]
+    for c in ["days_in_7d", "window_days_7d", "audi_7d", "show_7d", "days_in_prev7d", "window_days_prev7d", "audi_prev7d"]:
+        merged[c] = merged[c].astype("Int64")
+    for c in ["audi_avg_7d", "audi_avg_prev7d"]:
+        merged[c] = merged[c].astype("Int64")
+    return merged
+
+    merged = merged.copy()
+    rows = []
+    for d in sorted(merged["date"].dropna().unique()):
+        start = d - pd.Timedelta(days=window - 1)
+        win = merged[(merged["date"] >= start) & (merged["date"] <= d)]
+        total_audi, total_show = win["audi_cnt"].sum(), win["show_cnt"].sum()
+        base = total_audi / total_show if total_show > 0 else float("nan")
+        per_movie = win.groupby("movie_cd").agg(
+            days_in_7d=("date", "count"), audi_7d=("audi_cnt", "sum"), show_7d=("show_cnt", "sum"))
+        today = merged.loc[merged["date"] == d, ["movie_cd"]].join(per_movie, on="movie_cd")
+        today["window_days_7d"] = win["date"].nunique()
+        today["base"] = base
+        rows.append(today)
+
+    w = pd.concat(rows)
+    w["audi_per_show_7d"] = (w["audi_7d"] / w["show_7d"].where(w["show_7d"] > 0)).round(1)
+    w["efficiency_7d"] = ((w["audi_7d"] / w["show_7d"].where(w["show_7d"] > 0)) / w["base"]).round(2)
+    for c in cols:
+        merged[c] = w[c]
+    for c in ["days_in_7d", "window_days_7d", "audi_7d", "show_7d"]:
+        merged[c] = merged[c].astype("Int64")
     return merged
 
 
@@ -247,7 +338,7 @@ def merge_all(box, info, hol, log):
 # ─────────────────────────────────────────────
 def check_counts(log):
     """규칙이 깨지면 여기서 멈춘다 (틀린 결과를 조용히 저장하지 않도록)"""
-    assert log["box_raw"] - log["dup_exact"] - log["dup_key"] - log["na"] == log["box_clean"], "정리 단계 건수가 맞지 않음"
+    assert log["box_raw"] - log["dup_exact"] - log["dup_key"] - log["na"] - log["rerelease"] == log["box_clean"], "정리 단계 건수가 맞지 않음"
     assert log["merged"] == log["box_clean"], "결합 후 행 수가 바뀜 (상세정보나 공휴일에 중복이 있는지 확인)"
     if log["info_file"]:
         assert log["box_clean"] == log["info_ok"] + log["info_fail"], "매칭 성공+실패가 전체와 다름"
@@ -258,7 +349,10 @@ def write_report(merged, log, source_name, files):
     start, end = merged["date"].min().date(), merged["date"].max().date()
     all_days = pd.date_range(start, end).date
     missing_days = [d for d in all_days if d not in set(merged["date"].dt.date)]
-    per_day = merged.groupby(merged["date"].dt.date).size()
+    with_rr = pd.concat([merged[["date"]], log["rerelease_rows"][["date"]]])
+    per_day = with_rr.groupby(with_rr["date"].dt.date).size()
+    rr = log["rerelease_rows"]
+    rr_names = ", ".join(sorted(rr["movie_nm"].dropna().unique())) if len(rr) else "없음"
     odd_days = per_day[per_day != TOP_N]
 
     def zero(n, how):
@@ -281,10 +375,11 @@ def write_report(merged, log, source_name, files):
         f"| 제거: 완전히 같은 중복 | -{log['dup_exact']} | 같은 날짜를 두 번 수집한 경우 |",
         f"| 제거: 키 중복 (값이 다름) | -{log['dup_key']} | 같은 날짜·영화인데 값이 다른 행. 가장 나중에 수집한 값(fetched_at 기준)만 남김 |",
         f"| 제거: 필수값 빈칸 | -{log['na']} | {', '.join(REQUIRED)} 중 하나라도 빈 행 |",
+        f"| 제거: 재개봉작 | -{log['rerelease']} | 개봉 후 {RERELEASE_DAYS}일 초과 ({rr_names}) |",
         f"| **정리 후** | **{log['box_clean']}** | |",
         "",
-        f"- 기대 행 수: {days}일 × {TOP_N}편 = {days * TOP_N}행 → 실제 {log['box_clean']}행",
-        "- 하루 10편이 아닌 날: " + (", ".join(f"{d}({n}편)" for d, n in odd_days.items()) if len(odd_days) else "없음"),
+        f"- 기대 행 수: {days}일 × {TOP_N}편 − 재개봉작 {log['rerelease']}행 = {days * TOP_N - log['rerelease']}행 → 실제 {log['box_clean']}행",
+        f"- 재개봉작을 빼기 전 하루 {TOP_N}편이 아닌 날: " + (", ".join(f"{d}({n}편)" for d, n in odd_days.items()) if len(odd_days) else "없음"),
         "- 기간 중 빠진 날짜: " + (", ".join(str(d) for d in missing_days) if missing_days else "없음"),
         "",
         "## ② 영화 상세정보 결합 (영화코드 기준) : 전체 = 성공 + 실패",
@@ -324,7 +419,15 @@ def write_report(merged, log, source_name, files):
         f"- 계산한 행: {int(merged['audi_per_show'].notna().sum())} / 계산 못 한 행(상영 횟수 0 또는 빈칸): {int(merged['audi_per_show'].isna().sum())}",
         "- 계산식: audi_per_show = audi_cnt ÷ show_cnt (소수 첫째 자리 반올림)",
         "",
-        "## ⑤ 제거·실패 건수 (0건이면 확인한 방법)",
+        f"## ⑤ 이번 주와 전주 비교 (편성 판단용, {WINDOW}일씩)",
+        "",
+        "- 이번 주 = 기준일 포함 최근 7일, 전주 = 그 직전 7일",
+        f"- 전주 대비 증감률을 계산한 행: {int(merged['audi_change_7d'].notna().sum())} / 계산 못 한 행: {int(merged['audi_change_7d'].isna().sum())} (전주에 Top10 기록이 없거나, 수집 시작 직후라 전주 데이터가 없음)",
+        f"- 전주 7일 데이터가 모두 있는 행: {int((merged['window_days_prev7d'] == WINDOW).sum())}",
+        f"- 이번 주 Top10 일수가 5일 미만인 행: {int((merged['days_in_7d'] < 5).sum())} (평균을 믿기 어려워 판단 보류 권장)",
+        "- 계산식: audi_change_7d = (이번 주 관객 합 ÷ 이번 주 일수) ÷ (전주 관객 합 ÷ 전주 일수) × 100 − 100",
+        "",
+        "## ⑥ 제거·실패 건수 (0건이면 확인한 방법)",
         "",
         f"- 완전 중복: {zero(log['dup_exact'], '`duplicated()` 결과가 모두 False')}",
         f"- 키 중복: {zero(log['dup_key'], '`duplicated(subset=[date, movie_cd])` 결과가 모두 False')}",
@@ -338,7 +441,8 @@ def write_report(merged, log, source_name, files):
     (REPORT_DIR / "count_check.md").write_text("\n".join(lines), encoding="utf-8")
     log["unmatched"].to_csv(REPORT_DIR / "unmatched_movies.csv", index=False, encoding="utf-8-sig")
     # 지운 행도 따로 남겨서 나중에 이유를 확인할 수 있게
-    removed = pd.concat([log["dup_key_rows"].assign(reason="키 중복"), log["na_rows"].assign(reason="필수값 빈칸")])
+    removed = pd.concat([log["dup_key_rows"].assign(reason="키 중복"), log["na_rows"].assign(reason="필수값 빈칸"),
+                         log["rerelease_rows"].assign(reason="재개봉작")])
     removed.to_csv(REPORT_DIR / "removed_rows.csv", index=False, encoding="utf-8-sig")
 
 
@@ -381,7 +485,7 @@ def run():
     box = clean_boxoffice(box_raw, log)
     info = clean_info(info_raw, log)
     hol = clean_holidays(hol_raw, log)
-    print(f"② 정리: 원본 {log['box_raw']}행 − 중복 {log['dup_exact'] + log['dup_key']} − 빈칸 {log['na']} = {log['box_clean']}행")
+    print(f"② 정리: 원본 {log['box_raw']}행 − 중복 {log['dup_exact'] + log['dup_key']} − 빈칸 {log['na']} − 재개봉 {log['rerelease']} = {log['box_clean']}행")
 
     merged = merge_all(box, info, hol, log)
     check_counts(log)
@@ -391,9 +495,12 @@ def run():
         print("③ 결합: 상세정보 파일 없음 → 건너뜀")
 
     cols = ["date", "weekday", "day_type", "is_holiday", "holiday_name", "rank", "movie_cd", "movie_nm",
-            "open_dt", "days_since_open", "week_since_open", "is_rerelease",
+            "open_dt", "days_since_open", "week_since_open",
             "genre_nm", "nation_nm", "watch_grade_nm",
             "audi_cnt", "show_cnt", "audi_per_show", "show_share", "audi_share", "efficiency",
+            "days_in_7d", "audi_avg_7d", "days_in_prev7d", "audi_avg_prev7d", "audi_change_7d",
+            "window_days_7d", "window_days_prev7d", "audi_7d", "show_7d", "audi_prev7d",
+            "audi_per_show_7d", "efficiency_7d",
             "sales_amt", "avg_price", "scrn_cnt"]
     out = merged[[c for c in cols if c in merged.columns]].sort_values(["date", "rank"])
     out["date"] = out["date"].dt.strftime("%Y-%m-%d")
