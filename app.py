@@ -180,11 +180,49 @@ def render_trend():
         return
 
     pts = pd.DataFrame(trend["points"])
-    chart = pts.set_index("date")[["audi_per_show", "day_avg_audi_per_show"]].rename(
-        columns={"audi_per_show": "회당 관객 수", "day_avg_audi_per_show": "당일 평균"}
+
+    # Altair로 y축이 0부터 시작하고 상단이 잘리지 않도록 명시
+    import altair as alt
+
+    # 긴 형태(Long-form) 데이터로 변환
+    pts_melted = pts.melt(
+        id_vars=["date"],
+        value_vars=["audi_per_show", "day_avg_audi_per_show"],
+        var_name="구분",
+        value_name="회당관객수",
     )
-    st.line_chart(chart, x_label="날짜", y_label="회당 관객 수(명)",
-                  color=["#e4572e", "#9e9e9e"], height=320)
+    pts_melted["구분"] = pts_melted["구분"].map(
+        {"audi_per_show": "회당 관객 수", "day_avg_audi_per_show": "당일 평균"}
+    )
+
+    chart = (
+        alt.Chart(pts_melted)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("date:T", title="날짜"),
+            y=alt.Y(
+                "회당관객수:Q",
+                title="회당 관객 수 (명)",
+                scale=alt.Scale(zero=True),  # 0부터 시작하도록 고정하여 음수(-5) 방지
+            ),
+            color=alt.Color(
+                "구분:N",
+                scale=alt.Scale(
+                    domain=["회당 관객 수", "당일 평균"],
+                    range=["#e4572e", "#9e9e9e"],
+                ),
+                title="",
+            ),
+            tooltip=[
+                alt.Tooltip("date:T", title="날짜"),
+                alt.Tooltip("구분:N", title="구분"),
+                alt.Tooltip("회당관객수:Q", format=".1f", title="관객 수(명)"),
+            ],
+        )
+        .properties(height=340)
+    )
+
+    st.altair_chart(chart, use_container_width=True)
     st.caption(f"수집 기간 {len(fetch_dates()['dates'])}일 중 {len(pts)}일 박스오피스 순위에 포함된 날만 표시")
 
     show_table(pts, ["date", "rank", "open_week", "audi_cnt", "show_cnt",
